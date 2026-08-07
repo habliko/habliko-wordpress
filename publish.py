@@ -339,7 +339,7 @@ def groq_generate(lang, theme):
         "Write a complete blog article ENTIRELY in {lang_name}.\n\n"
         "TOPIC: {theme}\n\n"
         "Requirements:\n"
-        "- 600-900 words, natural and engaging, written for real learners.\n"
+        "- 450-650 words, natural and engaging, written for real learners.\n"
         "- Use clean HTML for the body ONLY: <h2>, <h3>, <p>, <ul>, <li>, <strong>. "
         "Do NOT include <html>, <head>, <body>, <h1> or the title inside the body.\n"
         "- Structure: short intro, 3-5 sections with <h2> subheadings, a brief conclusion.\n"
@@ -364,7 +364,10 @@ def groq_generate(lang, theme):
             {"role": "user", "content": user},
         ],
         "temperature": 0.8,
-        "max_tokens": 4000,
+        "max_tokens": 6000,
+        # gpt-oss es un modelo de razonamiento: con 'low' gasta menos tokens
+        # razonando y deja presupuesto para el articulo (evita el corte del JSON).
+        "reasoning_effort": "low",
         # Forzar salida JSON valida (modo nativo de Groq/OpenAI):
         "response_format": {"type": "json_object"},
     }
