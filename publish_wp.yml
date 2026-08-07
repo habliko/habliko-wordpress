@@ -1,0 +1,46 @@
+name: Habliko WordPress Publisher
+
+on:
+  schedule:
+    # Dos veces al dia (UTC), desfasado respecto a Blogger para repartir carga.
+    - cron: "0 9 * * *"
+    - cron: "0 19 * * *"
+  workflow_dispatch: {}   # permite lanzarlo a mano desde la pestaña Actions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: habliko-wordpress-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish one article
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          WORDPRESS_TOKEN: ${{ secrets.WORDPRESS_TOKEN }}
+        run: python3 publish.py
+
+      - name: Commit progress
+        if: success()
+        run: |
+          git config user.name "habliko-bot"
+          git config user.email "bot@habliko.com"
+          if [ -n "$(git status --porcelain progress.json)" ]; then
+            git add progress.json
+            git commit -m "chore: avance de progreso [skip ci]"
+            git push
+          else
+            echo "Sin cambios en progress.json"
+          fi
