@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Habliko Blogger publisher
--------------------------
-Clon del automatismo de roudeleiwen, adaptado a Habliko:
-  - 8 idiomas (es, en, fr, de, nl, it, pt, lb)
+Habliko WordPress.com publisher
+-------------------------------
+Gemelo del automatismo de Blogger, apuntando a WordPress.com como
+SEGUNDA fuente de enlaces:
+  - 8 idiomas (es, en, fr, de, nl, it, pt, lb) en UN solo sitio
   - banco de 90 temas de aprendizaje de idiomas
   - genera el articulo con Groq (openai/gpt-oss-120b)
-  - publica en Blogger via API v3 (OAuth refresh token)
+  - publica en WordPress.com via REST API v1.2 (token OAuth, sin refresh)
   - una publicacion por ejecucion, rotando idioma
+  - el idioma se usa como CATEGORIA para organizar el sitio multiidioma
   - progress.json lleva el puntero de idioma y de tema por idioma
   - CUALQUIER fallo => sys.exit(1) (GitHub Actions marca ROJO y avisa por email)
   - NO avanza el contador si algo falla (no se "salta" temas por error)
 
 Secrets necesarios (GitHub Actions -> Settings -> Secrets and variables -> Actions):
   GROQ_API_KEY
-  BLOGGER_CLIENT_ID
-  BLOGGER_CLIENT_SECRET
-  BLOGGER_REFRESH_TOKEN
-
-Rellena BLOG_IDS con los ID reales de cada blog (Blogger -> Configuracion, o
-sacandolo de la URL de blogger.com/blog/posts/XXXXXXXXXXXX).
+  WORDPRESS_TOKEN   (el access_token OAuth de WordPress.com)
 """
 
 import os
@@ -37,15 +34,10 @@ import urllib.error
 
 GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-BLOGGER_API = "https://www.googleapis.com/blogger/v3/blogs/{blog_id}/posts/"
+# Se puede usar el dominio como identificador del sitio (no hace falta el ID):
+WP_SITE = "habliko.wordpress.com"
+WP_API = "https://public-api.wordpress.com/rest/v1.2/sites/%s/posts/new/" % WP_SITE
 USER_AGENT = "habliko-publisher/1.0"
-
-# Segundos de espera entre idiomas dentro de un mismo run, para no exceder
-# el limite de tokens/min de Groq (free tier). ~75s deja 1 peticion por minuto.
-SLEEP_BETWEEN_LANGS = 75
-# Reintentos si Groq devuelve 429 (rate limit), con espera creciente.
-GROQ_RETRIES = 2
 
 # Enlace principal que se colara de forma natural en cada articulo
 HABLIKO_URL = "https://habliko.com"
@@ -121,17 +113,17 @@ LANG_NAMES = {
     "lb": "Luxembourgish (Lëtzebuergesch)",
 }
 
-# BLOG_IDS de cada blog de Blogger. pt y lb quedan pendientes de crear:
-# el script los SALTA sin fallar hasta que pongas su ID real.
-BLOG_IDS = {
-    "es": "964360975499223389",
-    "en": "9082383800610858202",
-    "fr": "7154476325430769028",
-    "de": "384660374309986997",
-    "nl": "1709888985974810265",
-    "it": "8541619948136491443",
-    "pt": "5959228735063577269",
-    "lb": "8172119296712136832",
+# Como es UN solo sitio multiidioma, cada post se etiqueta con la categoria
+# del idioma para mantenerlo organizado.
+LANG_CATEGORY = {
+    "es": "Español",
+    "en": "English",
+    "fr": "Français",
+    "de": "Deutsch",
+    "nl": "Nederlands",
+    "it": "Italiano",
+    "pt": "Português",
+    "lb": "Lëtzebuergesch",
 }
 
 PROGRESS_FILE = "progress.json"
@@ -395,22 +387,6 @@ def groq_generate(lang, theme):
     return article
 
 
-def groq_generate_retry(lang, theme):
-    """groq_generate con reintentos si salta el limite de tasa (429)."""
-    attempt = 0
-    while True:
-        try:
-            return groq_generate(lang, theme)
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < GROQ_RETRIES:
-                wait = 30 * (attempt + 1)
-                print("   429 rate limit; espero %ss y reintento..." % wait)
-                time.sleep(wait)
-                attempt += 1
-                continue
-            raise
-
-
 # ----------------------------------------------------------------------------
 # IMAGEN DE CABECERA
 # ----------------------------------------------------------------------------
@@ -513,39 +489,30 @@ def prepend_image(html, img_url, alt):
 
 
 # ----------------------------------------------------------------------------
-# BLOGGER
+# WORDPRESS.COM
 # ----------------------------------------------------------------------------
 
 
-def get_access_token():
-    tok = _post_form(
-        GOOGLE_TOKEN_URL,
-        {
-            "client_id": os.environ["BLOGGER_CLIENT_ID"],
-            "client_secret": os.environ["BLOGGER_CLIENT_SECRET"],
-            "refresh_token": os.environ["BLOGGER_REFRESH_TOKEN"],
-            "grant_type": "refresh_token",
-        },
-    )
-    if "access_token" not in tok:
-        raise RuntimeError("No se obtuvo access_token de Google: %s" % tok)
-    return tok["access_token"]
-
-
-def blogger_publish(blog_id, access_token, title, html, labels, meta):
-    url = BLOGGER_API.format(blog_id=blog_id)
-    # Anteponer la meta description como comentario oculto ayuda a Blogger a
-    # usarla como fragmento; la description real por-entrada se controla en el
-    # editor, pero dejamos el texto disponible en el cuerpo de forma discreta.
-    body = {
-        "kind": "blogger#post",
+def wp_publish(title, html, tags, category):
+    """Publica una entrada en WordPress.com via REST API v1.2.
+    tags: lista de etiquetas. category: nombre de categoria (idioma)."""
+    fields = {
         "title": title,
         "content": html,
-        "labels": labels[:4],
+        "status": "publish",
+        "tags": ",".join(tags[:4]),
+        "categories": category,
     }
-    headers = {"Authorization": "Bearer " + access_token}
-    resp = _post_json(url, body, headers, timeout=60)
-    return resp.get("url", "(sin url)")
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    req = urllib.request.Request(WP_API, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    return out.get("URL") or out.get("short_URL") or "(sin url)"
 
 
 # ----------------------------------------------------------------------------
@@ -553,52 +520,10 @@ def blogger_publish(blog_id, access_token, title, html, labels, meta):
 # ----------------------------------------------------------------------------
 
 
-def publish_one(lang, token, progress):
-    """Genera y publica UN idioma en su blog. Devuelve la URL. Avanza el
-    puntero de tema de ese idioma solo si la publicacion tiene exito."""
-    blog_id = BLOG_IDS.get(lang, "")
-    if not blog_id or blog_id.startswith("PON_AQUI"):
-        raise RuntimeError("blog '%s' sin BLOG_ID configurado" % lang)
-
-    topic_idx = progress["topic_pointer"][lang] % len(TOPICS)
-    topic = TOPICS[topic_idx]
-
-    print("-" * 60)
-    print("Idioma %s (%s) | Blog %s | Tema #%d: %s"
-          % (lang, LANG_NAMES[lang], blog_id, topic["num"], topic["theme"]))
-
-    article = groq_generate_retry(lang, topic["theme"])
-    print("   titulo: %s" % article["title"])
-
-    body_html = article["body_html"]
-    if ADD_IMAGE:
-        img_url = resolve_image_url(lang)
-        if img_url:
-            body_html = prepend_image(body_html, img_url, article["title"])
-
-    body_html = body_html + build_footer(lang)
-
-    post_url = blogger_publish(
-        blog_id, token,
-        article["title"], body_html,
-        article["labels"], article["meta_description"],
-    )
-    print("   OK publicado: %s" % post_url)
-
-    progress["topic_pointer"][lang] = topic_idx + 1
-    return post_url
-
-
 def main():
     # 1) Comprobaciones de configuracion
     missing = [
-        v
-        for v in (
-            "GROQ_API_KEY",
-            "BLOGGER_CLIENT_ID",
-            "BLOGGER_CLIENT_SECRET",
-            "BLOGGER_REFRESH_TOKEN",
-        )
+        v for v in ("GROQ_API_KEY", "WORDPRESS_TOKEN")
         if not os.environ.get(v)
     ]
     if missing:
@@ -607,47 +532,68 @@ def main():
 
     progress = load_progress()
 
-    print("== Habliko Blogger publisher (los 8 idiomas) ==")
+    lang = LANGUAGES[progress["lang_index"] % len(LANGUAGES)]
+    category = LANG_CATEGORY[lang]
 
-    # Token de Blogger una sola vez para todo el run
-    print("-> Obteniendo access_token de Google...")
+    topic_idx = progress["topic_pointer"][lang] % len(TOPICS)
+    topic = TOPICS[topic_idx]
+
+    print("== Habliko WordPress publisher ==")
+    print("Sitio       : %s" % WP_SITE)
+    print("Idioma      : %s (%s) -> categoria '%s'"
+          % (lang, LANG_NAMES[lang], category))
+    print("Tema #%-3d   : %s" % (topic["num"], topic["theme"]))
+
+    # 2) Generar articulo con Groq
+    print("-> Generando articulo con Groq (%s)..." % GROQ_MODEL)
     try:
-        token = get_access_token()
+        article = groq_generate(lang, topic["theme"])
     except urllib.error.HTTPError as e:
-        print("ERROR OAuth HTTP %s: %s" % (e.code, _read_http_error(e)))
+        print("ERROR Groq HTTP %s: %s" % (e.code, _read_http_error(e)))
         sys.exit(1)
     except Exception as e:
-        print("ERROR obteniendo token: %r" % e)
+        print("ERROR generando con Groq: %r" % e)
         sys.exit(1)
 
-    ok_list = []
-    fail_list = []
+    print("   titulo: %s" % article["title"])
+    print("   labels: %s" % ", ".join(article["labels"]))
 
-    for i, lang in enumerate(LANGUAGES):
-        try:
-            publish_one(lang, token, progress)
-            ok_list.append(lang)
-        except urllib.error.HTTPError as e:
-            print("   ERROR HTTP %s en '%s': %s"
-                  % (e.code, lang, _read_http_error(e)))
-            fail_list.append(lang)
-        except Exception as e:
-            print("   ERROR en '%s': %r" % (lang, e))
-            fail_list.append(lang)
+    # 2b) Imagen de cabecera 1x1 (no bloqueante)
+    body_html = article["body_html"]
+    if ADD_IMAGE:
+        print("-> Resolviendo imagen 1x1 de frase (%s)..." % lang)
+        img_url = resolve_image_url(lang)
+        if img_url:
+            print("   imagen: %s" % img_url)
+            body_html = prepend_image(body_html, img_url, article["title"])
+        else:
+            print("   sin imagen (se publica solo con texto)")
 
-        save_progress(progress)
+    # 2c) Pie con CTA (habliko.com) + QR de descarga
+    print("-> Anadiendo pie de descarga (CTA + QR)...")
+    body_html = body_html + build_footer(lang)
 
-        if i < len(LANGUAGES) - 1:
-            print("   ... espero %ss (limite Groq) ..." % SLEEP_BETWEEN_LANGS)
-            time.sleep(SLEEP_BETWEEN_LANGS)
-
-    print("=" * 60)
-    print("Resumen: %d OK (%s) | %d fallos (%s)"
-          % (len(ok_list), ", ".join(ok_list) or "-",
-             len(fail_list), ", ".join(fail_list) or "-"))
-
-    if fail_list:
+    # 3) Publicar en WordPress.com
+    print("-> Publicando en WordPress.com...")
+    try:
+        post_url = wp_publish(
+            article["title"], body_html, article["labels"], category
+        )
+    except urllib.error.HTTPError as e:
+        print("ERROR WordPress HTTP %s: %s" % (e.code, _read_http_error(e)))
         sys.exit(1)
+    except Exception as e:
+        print("ERROR publicando: %r" % e)
+        sys.exit(1)
+
+    print("OK publicado: %s" % post_url)
+
+    # 5) Solo si TODO fue bien: avanzar punteros y guardar
+    progress["topic_pointer"][lang] = topic_idx + 1
+    progress["lang_index"] = (progress["lang_index"] + 1) % len(LANGUAGES)
+    save_progress(progress)
+    print("Progreso guardado. Siguiente idioma: %s"
+          % LANGUAGES[progress["lang_index"]])
 
 
 if __name__ == "__main__":
