@@ -39,12 +39,6 @@ WP_SITE = "habliko.wordpress.com"
 WP_API = "https://public-api.wordpress.com/rest/v1.2/sites/%s/posts/new/" % WP_SITE
 USER_AGENT = "habliko-publisher/1.0"
 
-# Segundos de espera entre idiomas dentro de un mismo run, para no exceder
-# el limite de tokens/min de Groq (free tier). ~75s deja 1 peticion por minuto.
-SLEEP_BETWEEN_LANGS = 75
-# Reintentos si Groq devuelve 429 (rate limit), con espera creciente.
-GROQ_RETRIES = 2
-
 # Enlace principal que se colara de forma natural en cada articulo
 HABLIKO_URL = "https://habliko.com"
 HABLIKO_APP_URL = "https://foxi.habliko.com"
@@ -393,22 +387,6 @@ def groq_generate(lang, theme):
     return article
 
 
-def groq_generate_retry(lang, theme):
-    """groq_generate con reintentos si salta el limite de tasa (429)."""
-    attempt = 0
-    while True:
-        try:
-            return groq_generate(lang, theme)
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < GROQ_RETRIES:
-                wait = 30 * (attempt + 1)
-                print("   429 rate limit; espero %ss y reintento..." % wait)
-                time.sleep(wait)
-                attempt += 1
-                continue
-            raise
-
-
 # ----------------------------------------------------------------------------
 # IMAGEN DE CABECERA
 # ----------------------------------------------------------------------------
@@ -542,42 +520,6 @@ def wp_publish(title, html, tags, category):
 # ----------------------------------------------------------------------------
 
 
-def publish_one(lang, progress):
-    """Genera y publica UN idioma. Devuelve (ok, detalle). Avanza el puntero
-    de tema de ese idioma solo si la publicacion tiene exito."""
-    category = LANG_CATEGORY[lang]
-    topic_idx = progress["topic_pointer"][lang] % len(TOPICS)
-    topic = TOPICS[topic_idx]
-
-    print("-" * 60)
-    print("Idioma %s (%s) -> categoria '%s' | Tema #%d: %s"
-          % (lang, LANG_NAMES[lang], category, topic["num"], topic["theme"]))
-
-    # Generar con Groq (con reintento en 429)
-    article = groq_generate_retry(lang, topic["theme"])
-    print("   titulo: %s" % article["title"])
-
-    # Imagen 1x1 (no bloqueante)
-    body_html = article["body_html"]
-    if ADD_IMAGE:
-        img_url = resolve_image_url(lang)
-        if img_url:
-            body_html = prepend_image(body_html, img_url, article["title"])
-
-    # Pie con CTA + QR
-    body_html = body_html + build_footer(lang)
-
-    # Publicar
-    post_url = wp_publish(
-        article["title"], body_html, article["labels"], category
-    )
-    print("   OK publicado: %s" % post_url)
-
-    # Avanzar el puntero de tema de este idioma
-    progress["topic_pointer"][lang] = topic_idx + 1
-    return True, post_url
-
-
 def main():
     # 1) Comprobaciones de configuracion
     missing = [
@@ -590,40 +532,68 @@ def main():
 
     progress = load_progress()
 
-    print("== Habliko WordPress publisher (los 8 idiomas) ==")
-    print("Sitio: %s" % WP_SITE)
+    lang = LANGUAGES[progress["lang_index"] % len(LANGUAGES)]
+    category = LANG_CATEGORY[lang]
 
-    ok_list = []
-    fail_list = []
+    topic_idx = progress["topic_pointer"][lang] % len(TOPICS)
+    topic = TOPICS[topic_idx]
 
-    for i, lang in enumerate(LANGUAGES):
-        try:
-            publish_one(lang, progress)
-            ok_list.append(lang)
-        except urllib.error.HTTPError as e:
-            print("   ERROR HTTP %s en '%s': %s"
-                  % (e.code, lang, _read_http_error(e)))
-            fail_list.append(lang)
-        except Exception as e:
-            print("   ERROR en '%s': %r" % (lang, e))
-            fail_list.append(lang)
+    print("== Habliko WordPress publisher ==")
+    print("Sitio       : %s" % WP_SITE)
+    print("Idioma      : %s (%s) -> categoria '%s'"
+          % (lang, LANG_NAMES[lang], category))
+    print("Tema #%-3d   : %s" % (topic["num"], topic["theme"]))
 
-        # Guardar progreso tras cada idioma (por si el run se corta)
-        save_progress(progress)
-
-        # Pausa entre idiomas para respetar el limite de Groq (salvo el ultimo)
-        if i < len(LANGUAGES) - 1:
-            print("   ... espero %ss (limite Groq) ..." % SLEEP_BETWEEN_LANGS)
-            time.sleep(SLEEP_BETWEEN_LANGS)
-
-    print("=" * 60)
-    print("Resumen: %d OK (%s) | %d fallos (%s)"
-          % (len(ok_list), ", ".join(ok_list) or "-",
-             len(fail_list), ", ".join(fail_list) or "-"))
-
-    # Si algun idioma fallo, salir con error para que GitHub avise por email
-    if fail_list:
+    # 2) Generar articulo con Groq
+    print("-> Generando articulo con Groq (%s)..." % GROQ_MODEL)
+    try:
+        article = groq_generate(lang, topic["theme"])
+    except urllib.error.HTTPError as e:
+        print("ERROR Groq HTTP %s: %s" % (e.code, _read_http_error(e)))
         sys.exit(1)
+    except Exception as e:
+        print("ERROR generando con Groq: %r" % e)
+        sys.exit(1)
+
+    print("   titulo: %s" % article["title"])
+    print("   labels: %s" % ", ".join(article["labels"]))
+
+    # 2b) Imagen de cabecera 1x1 (no bloqueante)
+    body_html = article["body_html"]
+    if ADD_IMAGE:
+        print("-> Resolviendo imagen 1x1 de frase (%s)..." % lang)
+        img_url = resolve_image_url(lang)
+        if img_url:
+            print("   imagen: %s" % img_url)
+            body_html = prepend_image(body_html, img_url, article["title"])
+        else:
+            print("   sin imagen (se publica solo con texto)")
+
+    # 2c) Pie con CTA (habliko.com) + QR de descarga
+    print("-> Anadiendo pie de descarga (CTA + QR)...")
+    body_html = body_html + build_footer(lang)
+
+    # 3) Publicar en WordPress.com
+    print("-> Publicando en WordPress.com...")
+    try:
+        post_url = wp_publish(
+            article["title"], body_html, article["labels"], category
+        )
+    except urllib.error.HTTPError as e:
+        print("ERROR WordPress HTTP %s: %s" % (e.code, _read_http_error(e)))
+        sys.exit(1)
+    except Exception as e:
+        print("ERROR publicando: %r" % e)
+        sys.exit(1)
+
+    print("OK publicado: %s" % post_url)
+
+    # 5) Solo si TODO fue bien: avanzar punteros y guardar
+    progress["topic_pointer"][lang] = topic_idx + 1
+    progress["lang_index"] = (progress["lang_index"] + 1) % len(LANGUAGES)
+    save_progress(progress)
+    print("Progreso guardado. Siguiente idioma: %s"
+          % LANGUAGES[progress["lang_index"]])
 
 
 if __name__ == "__main__":
