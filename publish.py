@@ -32,8 +32,30 @@ import urllib.error
 # CONFIG
 # ----------------------------------------------------------------------------
 
-GROQ_MODEL = "openai/gpt-oss-120b"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ----------------------------------------------------------------------------
+# PROVEEDORES DE IA (Cerebras principal + Groq respaldo; ambos gpt-oss-120b).
+# Se prueban en orden; si uno da 429 (cupo), salta al siguiente.
+# Solo se usa un proveedor si su API key esta definida como secret.
+#   Cerebras: ~1.000.000 tokens/dia gratis | Groq: ~200.000 tokens/dia gratis
+# ----------------------------------------------------------------------------
+PROVIDERS = [
+    {
+        "name": "cerebras",
+        "url": "https://api.cerebras.ai/v1/chat/completions",
+        "key_env": "CEREBRAS_API_KEY",
+        "model": "gpt-oss-120b",
+        "max_tokens": 6000,
+        "reasoning_effort": "low",
+    },
+    {
+        "name": "groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key_env": "GROQ_API_KEY",
+        "model": "openai/gpt-oss-120b",
+        "max_tokens": 6000,
+        "reasoning_effort": "low",
+    },
+]
 # Se puede usar el dominio como identificador del sitio (no hace falta el ID):
 WP_SITE = "habliko.wordpress.com"
 WP_API = "https://public-api.wordpress.com/rest/v1.2/sites/%s/posts/new/" % WP_SITE
@@ -333,6 +355,51 @@ def _parse_json_lenient(content):
     raise ValueError("No se pudo interpretar la respuesta de Groq como JSON")
 
 
+
+def _provider_request(provider, system, user):
+    payload = {
+        "model": provider["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.8,
+        "max_tokens": provider.get("max_tokens", 6000),
+        "response_format": {"type": "json_object"},
+    }
+    if provider.get("reasoning_effort"):
+        payload["reasoning_effort"] = provider["reasoning_effort"]
+    headers = {"Authorization": "Bearer " + os.environ[provider["key_env"]]}
+    resp = _post_json(provider["url"], payload, headers)
+    return (resp["choices"][0]["message"]["content"] or "").strip()
+
+
+def _multi_generate(system, user):
+    """Devuelve el texto (JSON) generado por el primer proveedor que responda.
+    Si uno da 429, prueba el siguiente. Usa solo proveedores con API key."""
+    active = [p for p in PROVIDERS if os.environ.get(p["key_env"])]
+    if not active:
+        raise RuntimeError("Ningun proveedor tiene API key (CEREBRAS/GROQ)")
+    last = None
+    for p in active:
+        try:
+            content = _provider_request(p, system, user)
+            if p is not active[0]:
+                print("   (respaldo: %s)" % p["name"])
+            return content
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("   %s dio 429; pruebo el siguiente..." % p["name"])
+                last = e
+                continue
+            last = e
+            break
+        except Exception as e:
+            last = e
+            break
+    raise last or RuntimeError("Fallo la generacion en todos los proveedores")
+
+
 def groq_generate(lang, theme):
     lang_name = LANG_NAMES[lang]
     system = (
@@ -363,30 +430,13 @@ def groq_generate(lang, theme):
         "- body_html: the HTML article as a single string."
     ).format(lang_name=lang_name, theme=theme, habliko=HABLIKO_URL)
 
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.8,
-        "max_tokens": 6000,
-        # gpt-oss es un modelo de razonamiento: con 'low' gasta menos tokens
-        # razonando y deja presupuesto para el articulo (evita el corte del JSON).
-        "reasoning_effort": "low",
-        # Forzar salida JSON valida (modo nativo de Groq/OpenAI):
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Authorization": "Bearer " + os.environ["GROQ_API_KEY"]}
-
-    resp = _post_json(GROQ_URL, payload, headers)
-    content = (resp["choices"][0]["message"]["content"] or "").strip()
+    content = _multi_generate(system, user)
 
     article = _parse_json_lenient(content)
 
     for key in ("title", "meta_description", "labels", "body_html"):
         if key not in article or not article[key]:
-            raise ValueError("Groq no devolvio el campo '%s'" % key)
+            raise ValueError("El proveedor no devolvio el campo '%s'" % key)
     if not isinstance(article["labels"], list):
         article["labels"] = [str(article["labels"])]
 
@@ -580,13 +630,15 @@ def publish_one(lang, progress):
 
 def main():
     # 1) Comprobaciones de configuracion
-    missing = [
-        v for v in ("GROQ_API_KEY", "WORDPRESS_TOKEN")
-        if not os.environ.get(v)
-    ]
-    if missing:
-        print("ERROR: faltan secrets: %s" % ", ".join(missing))
+    if not os.environ.get("WORDPRESS_TOKEN"):
+        print("ERROR: falta secret WORDPRESS_TOKEN")
         sys.exit(1)
+    active = [p["name"] for p in PROVIDERS if os.environ.get(p["key_env"])]
+    if not active:
+        print("ERROR: falta al menos una API key de IA "
+              "(CEREBRAS_API_KEY y/o GROQ_API_KEY)")
+        sys.exit(1)
+    print("Proveedores IA (en orden): %s" % ", ".join(active))
 
     progress = load_progress()
 
