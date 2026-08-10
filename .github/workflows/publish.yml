@@ -28,6 +28,7 @@ jobs:
 
       - name: Publish one article
         env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           WORDPRESS_TOKEN: ${{ secrets.WORDPRESS_TOKEN }}
         run: python3 publish.py
