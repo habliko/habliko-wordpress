@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import time
+import datetime
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -70,6 +71,36 @@ GROQ_RETRIES = 2
 # Enlace principal que se colara de forma natural en cada articulo
 HABLIKO_URL = "https://habliko.com"
 HABLIKO_APP_URL = "https://foxi.habliko.com"
+
+# --- Contacto (usado en el bloque FAQ) ---
+HABLIKO_EMAIL = "hola@habliko.com"
+# WhatsApp: PENDIENTE. En cuanto tengas el numero, ponlo aqui en formato
+# internacional SIN "+", espacios ni guiones (ej: "352691234567").
+# Mientras este vacio, el bloque FAQ NO muestra el enlace de WhatsApp.
+HABLIKO_WHATSAPP = ""  # p.ej. "352691234567"
+
+# --- Datos REALES de Habliko (se pasan al prompt para que los teja de forma
+#     natural en vez de soltar adjetivos vacios). El modelo tiene ORDEN de no
+#     inventar otros ni listarlos mecanicamente. Editalos aqui si algo cambia. ---
+HABLIKO_FACTS = (
+    "Habliko is a language-learning app; its mascot is Foxi, a friendly AI fox "
+    "tutor. It teaches 8 languages (Spanish, English, French, German, Dutch, "
+    "Italian, Portuguese, Luxembourgish), across CEFR levels A1 to C2. Lessons "
+    "are short and paired with mini-games. You can start for free; Premium is "
+    "2 EUR/month or 24 EUR/year. Habliko is also offered to schools and language "
+    "institutes (lycees)."
+)
+
+# --- Datos de marca para el schema Organization (entidad estable para la IA) ---
+HABLIKO_ORG_NAME = "Habliko"
+HABLIKO_LOGO_URL = "https://media.habliko.com/habliko/logos/logo.png"  # bucket habliko-media servido en media.habliko.com
+HABLIKO_SAMEAS = [
+    "https://mastodon.social/@habliko",
+    "https://habliko.wordpress.com",
+    # "https://bsky.app/profile/habliko.bsky.social",   # cuando crees la cuenta
+    # "https://www.youtube.com/@habliko",                # si lo tienes
+]
+HABLIKO_AUTHOR = "Equipo Habliko"
 
 # --- Imagen de cabecera (1x1 frase servida por el media worker de R2) ---
 # Poner en False para publicar sin imagen.
@@ -416,10 +447,18 @@ def groq_generate(lang, theme):
         "- Use clean HTML for the body ONLY: <h2>, <h3>, <p>, <ul>, <li>, <strong>. "
         "Do NOT include <html>, <head>, <body>, <h1> or the title inside the body.\n"
         "- Structure: short intro, 3-5 sections with <h2> subheadings, a brief conclusion.\n"
-        "- Weave in the site link naturally 2-3 times across the article "
-        "(for example once in the intro, once mid-article, and once near the end): "
-        "link the text to {habliko}. Mention Habliko and Foxi warmly, never spammy. "
-        "Vary the anchor text, don't repeat the exact same phrase.\n"
+        "- EXTRACTABILITY (important): begin EACH <h2> section with a direct, "
+        "self-contained answer of 1-2 sentences (about 40-60 words) that fully "
+        "answers that section's question on its own, THEN elaborate. Lead with the "
+        "answer, never bury it. This helps the passage stand alone if quoted.\n"
+        "- Link to the site ONCE only, naturally, where it fits best (usually near "
+        "the end): link a few descriptive words (varied, not the bare URL, not "
+        "'click here') to {habliko}. Mention Habliko and Foxi warmly, never spammy. "
+        "Do NOT repeat the link or stuff keywords.\n"
+        "- Where genuinely relevant, weave in ONE or TWO concrete facts about "
+        "Habliko from the list below to make the article specific and citable. "
+        "Never invent facts beyond this list, and never dump them as a list:\n"
+        "  FACTS: {facts}\n"
         "- Everything (title, meta, labels, body) MUST be in {lang_name}.\n\n"
         "Return ONLY a valid JSON object, no markdown fences, with EXACTLY these keys:\n"
         '{{"title": "...", "meta_description": "...", '
@@ -428,7 +467,8 @@ def groq_generate(lang, theme):
         "- meta_description: <= 155 characters.\n"
         "- labels: 2 to 4 short topical tags in {lang_name}.\n"
         "- body_html: the HTML article as a single string."
-    ).format(lang_name=lang_name, theme=theme, habliko=HABLIKO_URL)
+    ).format(lang_name=lang_name, theme=theme, habliko=HABLIKO_URL,
+             facts=HABLIKO_FACTS)
 
     content = _multi_generate(system, user)
 
@@ -518,6 +558,293 @@ def _qr_block(img_url, label, caption_alt):
         '<div style="font-size:0.85em;color:#444;margin-top:4px;">%s</div>'
         "</div>"
     ) % (img_url, _html_escape(caption_alt), label)
+
+
+# ----------------------------------------------------------------------------
+# FAQ (va DESPUES del articulo y ANTES del pie con los QR)
+# 5 preguntas reales por idioma. La respuesta da la solucion directa y, cuando
+# procede, empuja a la web (respuesta completa), al email o a WhatsApp.
+# Ademas se inyecta schema.org FAQPage (JSON-LD) para que Google la lea.
+# NOTA WordPress.com: puede sanear/eliminar etiquetas <script>. El bloque FAQ
+# VISIBLE (texto) es lo que de verdad ayuda aqui; el JSON-LD se incluye por si
+# tu plan lo respeta, pero no dependas de el en WordPress.com.
+# ----------------------------------------------------------------------------
+
+FAQ_TITLE = {
+    "es": "Preguntas frecuentes",
+    "en": "Frequently asked questions",
+    "fr": "Questions fréquentes",
+    "de": "Häufige Fragen",
+    "nl": "Veelgestelde vragen",
+    "it": "Domande frequenti",
+    "pt": "Perguntas frequentes",
+    "lb": "Dacks gestallte Froen",
+}
+
+FAQ_ITEMS = {
+    "es": [
+        ("¿Qué es Habliko?",
+         "Habliko es una app para aprender idiomas con Foxi, un tutor con IA. "
+         "Tiene lecciones cortas, minijuegos y un método claro de A1 a C2. "
+         "Puedes empezar gratis en <a href=\"{url}\">habliko.com</a>."),
+        ("¿Cuánto cuesta?",
+         "Puedes empezar gratis. El plan Premium cuesta 2 €/mes o 24 €/año "
+         "y desbloquea todas las lecciones y funciones."),
+        ("¿Qué idiomas puedo aprender?",
+         "Español, inglés, francés, alemán, neerlandés, italiano, portugués y "
+         "luxemburgués, cada uno con lecciones adaptadas a tu nivel."),
+        ("¿Cómo empiezo?",
+         "Entra en <a href=\"{url}\">habliko.com</a>, elige tu idioma y haz la "
+         "primera lección. No necesitas instalar nada para probarla."),
+        ("¿Ofrecéis Habliko para institutos y centros?",
+         "Sí. Tenemos una versión para lycées y centros de idiomas. "
+         "Escríbenos y te contamos cómo funciona."),
+    ],
+    "en": [
+        ("What is Habliko?",
+         "Habliko is an app to learn languages with Foxi, an AI tutor. "
+         "It offers short lessons, mini-games and a clear method from A1 to C2. "
+         "You can start for free at <a href=\"{url}\">habliko.com</a>."),
+        ("How much does it cost?",
+         "You can start for free. Premium is 2 €/month or 24 €/year and unlocks "
+         "all lessons and features."),
+        ("Which languages can I learn?",
+         "Spanish, English, French, German, Dutch, Italian, Portuguese and "
+         "Luxembourgish, each with lessons adapted to your level."),
+        ("How do I get started?",
+         "Go to <a href=\"{url}\">habliko.com</a>, pick your language and do the "
+         "first lesson. You don't need to install anything to try it."),
+        ("Do you offer Habliko for schools and institutes?",
+         "Yes. We have a version for lycées and language centres. "
+         "Get in touch and we'll tell you how it works."),
+    ],
+    "fr": [
+        ("Qu'est-ce que Habliko ?",
+         "Habliko est une appli pour apprendre les langues avec Foxi, un tuteur "
+         "IA. Leçons courtes, mini-jeux et une méthode claire de A1 à C2. "
+         "Commence gratuitement sur <a href=\"{url}\">habliko.com</a>."),
+        ("Combien ça coûte ?",
+         "Tu peux commencer gratuitement. L'offre Premium est à 2 €/mois ou "
+         "24 €/an et débloque toutes les leçons et fonctions."),
+        ("Quelles langues puis-je apprendre ?",
+         "Espagnol, anglais, français, allemand, néerlandais, italien, portugais "
+         "et luxembourgeois, chacune avec des leçons adaptées à ton niveau."),
+        ("Comment commencer ?",
+         "Va sur <a href=\"{url}\">habliko.com</a>, choisis ta langue et fais la "
+         "première leçon. Rien à installer pour l'essayer."),
+        ("Proposez-vous Habliko pour les lycées et les centres ?",
+         "Oui. Nous avons une version pour les lycées et centres de langues. "
+         "Écris-nous et nous t'expliquons comment ça marche."),
+    ],
+    "de": [
+        ("Was ist Habliko?",
+         "Habliko ist eine App zum Sprachenlernen mit Foxi, einem KI-Tutor. "
+         "Kurze Lektionen, Minispiele und eine klare Methode von A1 bis C2. "
+         "Starte kostenlos auf <a href=\"{url}\">habliko.com</a>."),
+        ("Was kostet es?",
+         "Du kannst kostenlos starten. Premium kostet 2 €/Monat oder 24 €/Jahr "
+         "und schaltet alle Lektionen und Funktionen frei."),
+        ("Welche Sprachen kann ich lernen?",
+         "Spanisch, Englisch, Französisch, Deutsch, Niederländisch, Italienisch, "
+         "Portugiesisch und Luxemburgisch, jeweils passend zu deinem Niveau."),
+        ("Wie fange ich an?",
+         "Geh auf <a href=\"{url}\">habliko.com</a>, wähle deine Sprache und mach "
+         "die erste Lektion. Zum Ausprobieren musst du nichts installieren."),
+        ("Gibt es Habliko für Schulen und Institute?",
+         "Ja. Wir haben eine Version für Lycées und Sprachzentren. "
+         "Schreib uns und wir erklären dir, wie es funktioniert."),
+    ],
+    "nl": [
+        ("Wat is Habliko?",
+         "Habliko is een app om talen te leren met Foxi, een AI-tutor. "
+         "Korte lessen, minigames en een duidelijke methode van A1 tot C2. "
+         "Begin gratis op <a href=\"{url}\">habliko.com</a>."),
+        ("Wat kost het?",
+         "Je kunt gratis beginnen. Premium kost 2 €/maand of 24 €/jaar en "
+         "ontgrendelt alle lessen en functies."),
+        ("Welke talen kan ik leren?",
+         "Spaans, Engels, Frans, Duits, Nederlands, Italiaans, Portugees en "
+         "Luxemburgs, elk met lessen op jouw niveau."),
+        ("Hoe begin ik?",
+         "Ga naar <a href=\"{url}\">habliko.com</a>, kies je taal en doe de "
+         "eerste les. Je hoeft niets te installeren om het te proberen."),
+        ("Bieden jullie Habliko voor scholen en instituten?",
+         "Ja. We hebben een versie voor lycées en taalcentra. "
+         "Neem contact op en we vertellen je hoe het werkt."),
+    ],
+    "it": [
+        ("Cos'è Habliko?",
+         "Habliko è un'app per imparare le lingue con Foxi, un tutor IA. "
+         "Lezioni brevi, mini-giochi e un metodo chiaro dall'A1 al C2. "
+         "Inizia gratis su <a href=\"{url}\">habliko.com</a>."),
+        ("Quanto costa?",
+         "Puoi iniziare gratis. Premium costa 2 €/mese o 24 €/anno e sblocca "
+         "tutte le lezioni e le funzioni."),
+        ("Quali lingue posso imparare?",
+         "Spagnolo, inglese, francese, tedesco, olandese, italiano, portoghese e "
+         "lussemburghese, ognuna con lezioni adatte al tuo livello."),
+        ("Come inizio?",
+         "Vai su <a href=\"{url}\">habliko.com</a>, scegli la lingua e fai la "
+         "prima lezione. Non devi installare nulla per provarla."),
+        ("Offrite Habliko per licei e istituti?",
+         "Sì. Abbiamo una versione per licei e centri linguistici. "
+         "Scrivici e ti spieghiamo come funziona."),
+    ],
+    "pt": [
+        ("O que é o Habliko?",
+         "O Habliko é uma app para aprender línguas com o Foxi, um tutor com IA. "
+         "Lições curtas, minijogos e um método claro do A1 ao C2. "
+         "Começa grátis em <a href=\"{url}\">habliko.com</a>."),
+        ("Quanto custa?",
+         "Podes começar grátis. O Premium custa 2 €/mês ou 24 €/ano e desbloqueia "
+         "todas as lições e funcionalidades."),
+        ("Que línguas posso aprender?",
+         "Espanhol, inglês, francês, alemão, neerlandês, italiano, português e "
+         "luxemburguês, cada uma com lições adaptadas ao teu nível."),
+        ("Como começo?",
+         "Vai a <a href=\"{url}\">habliko.com</a>, escolhe a tua língua e faz a "
+         "primeira lição. Não precisas de instalar nada para experimentar."),
+        ("Têm o Habliko para escolas e institutos?",
+         "Sim. Temos uma versão para liceus e centros de línguas. "
+         "Contacta-nos e explicamos como funciona."),
+    ],
+    "lb": [
+        ("Wat ass Habliko?",
+         "Habliko ass eng App fir Sproochen ze léieren mat Foxi, engem KI-Tuteur. "
+         "Kuerz Lektiounen, Minispiller an eng kloer Method vun A1 bis C2. "
+         "Fänk gratis un op <a href=\"{url}\">habliko.com</a>."),
+        ("Wat kascht et?",
+         "Du kanns gratis ufänken. Premium kascht 2 €/Mount oder 24 €/Joer an "
+         "entspaart all Lektiounen a Funktiounen."),
+        ("Wéi eng Sproochen kann ech léieren?",
+         "Spuenesch, Englesch, Franséisch, Däitsch, Hollännesch, Italienesch, "
+         "Portugisesch a Lëtzebuergesch, all mat Lektiounen op dengem Niveau."),
+        ("Wéi fänken ech un?",
+         "Gitt op <a href=\"{url}\">habliko.com</a>, wielt Är Sprooch a maacht déi "
+         "éischt Lektioun. Dir musst näischt installéieren fir et ze probéieren."),
+        ("Gitt et Habliko fir Schoulen an Instituter?",
+         "Jo. Mir hunn eng Versioun fir Lycéeën a Sproochenzentren. "
+         "Schreift eis an mir erklären Iech wéi et funktionéiert."),
+    ],
+}
+
+FAQ_CONTACT = {
+    "es": ("¿No encuentras tu respuesta? Visita <a href=\"{url}\">habliko.com</a>, "
+           "escríbenos a {email}{wa} y te ayudamos."),
+    "en": ("Can't find your answer? Visit <a href=\"{url}\">habliko.com</a>, "
+           "email us at {email}{wa} and we'll help."),
+    "fr": ("Tu ne trouves pas ta réponse ? Va sur <a href=\"{url}\">habliko.com</a>, "
+           "écris-nous à {email}{wa} et on t'aide."),
+    "de": ("Keine Antwort gefunden? Besuche <a href=\"{url}\">habliko.com</a>, "
+           "schreib uns an {email}{wa} und wir helfen dir."),
+    "nl": ("Geen antwoord gevonden? Ga naar <a href=\"{url}\">habliko.com</a>, "
+           "mail ons op {email}{wa} en we helpen je."),
+    "it": ("Non trovi la risposta? Vai su <a href=\"{url}\">habliko.com</a>, "
+           "scrivici a {email}{wa} e ti aiutiamo."),
+    "pt": ("Não encontras a resposta? Vai a <a href=\"{url}\">habliko.com</a>, "
+           "escreve-nos para {email}{wa} e nós ajudamos."),
+    "lb": ("Keng Äntwert fonnt? Gitt op <a href=\"{url}\">habliko.com</a>, "
+           "schreift eis op {email}{wa} a mir hëllefen Iech."),
+}
+
+FAQ_WA_LABEL = {
+    "es": "por WhatsApp", "en": "on WhatsApp", "fr": "sur WhatsApp",
+    "de": "per WhatsApp", "nl": "via WhatsApp", "it": "su WhatsApp",
+    "pt": "pelo WhatsApp", "lb": "iwwer WhatsApp",
+}
+
+
+def _faq_contact_line(lang):
+    """Construye la linea de contacto: email + (WhatsApp si hay numero)."""
+    email_link = '<a href="mailto:%s">%s</a>' % (HABLIKO_EMAIL, HABLIKO_EMAIL)
+    wa = ""
+    if HABLIKO_WHATSAPP.strip():
+        label = FAQ_WA_LABEL.get(lang, FAQ_WA_LABEL["en"])
+        sep = " o " if lang == "es" else " / "
+        wa = '%s<a href="https://wa.me/%s">%s</a>' % (
+            sep, HABLIKO_WHATSAPP.strip(), label)
+    tpl = FAQ_CONTACT.get(lang, FAQ_CONTACT["en"])
+    return tpl.format(url=HABLIKO_URL, email=email_link, wa=wa)
+
+
+def build_faq(lang):
+    """Bloque FAQ visible + schema.org FAQPage (JSON-LD).
+    Se coloca DESPUES del cuerpo del articulo y ANTES del pie con los QR."""
+    items = FAQ_ITEMS.get(lang, FAQ_ITEMS["en"])
+    title = FAQ_TITLE.get(lang, FAQ_TITLE["en"])
+
+    parts = [
+        '<hr style="margin:2em 0 1.2em 0;border:none;border-top:1px solid #eee;" />',
+        '<section style="margin:0 0 1em 0;">',
+        '<h2 style="margin:0 0 0.6em 0;">%s</h2>' % _html_escape(title),
+    ]
+    schema_items = []
+    for q, a_tpl in items:
+        a_html = a_tpl.format(url=HABLIKO_URL)
+        parts.append(
+            '<div style="margin:0 0 0.9em 0;">'
+            '<p style="margin:0 0 0.2em 0;"><strong>%s</strong></p>'
+            '<p style="margin:0;">%s</p>'
+            '</div>' % (_html_escape(q), a_html)
+        )
+        a_plain = a_html.replace('<a href="%s">' % HABLIKO_URL, "") \
+                        .replace("</a>", "")
+        schema_items.append({
+            "@type": "Question",
+            "name": q,
+            "acceptedAnswer": {"@type": "Answer", "text": a_plain},
+        })
+
+    parts.append(
+        '<p style="margin:0.4em 0 0 0;font-size:0.95em;color:#555;">%s</p>'
+        % _faq_contact_line(lang)
+    )
+    parts.append("</section>")
+
+    schema = {
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": schema_items,
+    }
+    parts.append(
+        '<script type="application/ld+json">%s</script>'
+        % json.dumps(schema, ensure_ascii=False)
+    )
+    return "".join(parts)
+
+
+def build_schema(lang, title, meta_description):
+    """Schema.org JSON-LD: BlogPosting + Organization (grafo).
+    NOTA: WordPress.com puede eliminar <script>; ademas Jetpack ya genera
+    schema de articulo. Se incluye por consistencia con Blogger."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat()
+    org = {
+        "@type": "Organization",
+        "@id": HABLIKO_URL + "/#organization",
+        "name": HABLIKO_ORG_NAME,
+        "url": HABLIKO_URL,
+        "logo": {"@type": "ImageObject", "url": HABLIKO_LOGO_URL},
+        "description": ("Habliko is a language-learning app with Foxi, an AI fox "
+                        "tutor: short lessons and mini-games from A1 to C2."),
+    }
+    if HABLIKO_SAMEAS:
+        org["sameAs"] = HABLIKO_SAMEAS
+    blogposting = {
+        "@type": "BlogPosting",
+        "headline": title,
+        "description": meta_description,
+        "inLanguage": lang,
+        "datePublished": now_iso,
+        "dateModified": now_iso,
+        "author": {"@type": "Organization", "name": HABLIKO_AUTHOR,
+                   "url": HABLIKO_URL},
+        "publisher": {"@id": HABLIKO_URL + "/#organization"},
+        "mainEntityOfPage": {"@type": "WebPage", "@id": HABLIKO_URL},
+    }
+    graph = {"@context": "https://schema.org", "@graph": [blogposting, org]}
+    return ('<script type="application/ld+json">%s</script>'
+            % json.dumps(graph, ensure_ascii=False))
 
 
 def build_footer(lang):
@@ -614,8 +941,11 @@ def publish_one(lang, progress):
         if img_url:
             body_html = prepend_image(body_html, img_url, article["title"])
 
-    # Pie con CTA + QR
-    body_html = body_html + build_footer(lang)
+    # FAQ justo despues del articulo y ANTES del pie con los QR
+    body_html = body_html + build_faq(lang) + build_footer(lang)
+    # Schema BlogPosting + Organization (WordPress.com puede saltarselo)
+    body_html = body_html + build_schema(
+        lang, article["title"], article["meta_description"])
 
     # Publicar
     post_url = wp_publish(
