@@ -104,6 +104,12 @@ HABLIKO_SAMEAS = [
 ]
 HABLIKO_AUTHOR = "Equipo Habliko"
 
+# WordPress.com SANEA las etiquetas <script> y deja el JSON-LD como TEXTO
+# VISIBLE en el articulo (feo). Por eso aqui el schema JSON-LD va APAGADO.
+# La FAQ VISIBLE (texto) si se publica y es la que ayuda al GEO en WordPress.
+# Ponlo en True solo si tu plan/plugin permite <script> en el contenido.
+ADD_JSONLD_SCHEMA = False
+
 # --- Imagen de cabecera (1x1 frase servida por el media worker de R2) ---
 # Poner en False para publicar sin imagen.
 ADD_IMAGE = True
@@ -803,15 +809,16 @@ def build_faq(lang):
     )
     parts.append("</section>")
 
-    schema = {
-        "@context": "https://schema.org",
-        "@type": "FAQPage",
-        "mainEntity": schema_items,
-    }
-    parts.append(
-        '<script type="application/ld+json">%s</script>'
-        % json.dumps(schema, ensure_ascii=False)
-    )
+    if ADD_JSONLD_SCHEMA:
+        schema = {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": schema_items,
+        }
+        parts.append(
+            '<script type="application/ld+json">%s</script>'
+            % json.dumps(schema, ensure_ascii=False)
+        )
     return "".join(parts)
 
 
@@ -984,9 +991,10 @@ def publish_one(lang, progress):
 
     # FAQ justo despues del articulo y ANTES del pie con los QR
     body_html = body_html + build_faq(lang) + build_footer(lang)
-    # Schema BlogPosting + Organization (WordPress.com puede saltarselo)
-    body_html = body_html + build_schema(
-        lang, article["title"], article["meta_description"])
+    # Schema BlogPosting + Organization solo si esta permitido (WordPress.com no)
+    if ADD_JSONLD_SCHEMA:
+        body_html = body_html + build_schema(
+            lang, article["title"], article["meta_description"])
 
     # Publicar (con imagen destacada si se pudo subir)
     post_url = wp_publish(
