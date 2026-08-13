@@ -60,6 +60,8 @@ PROVIDERS = [
 # Se puede usar el dominio como identificador del sitio (no hace falta el ID):
 WP_SITE = "habliko.wordpress.com"
 WP_API = "https://public-api.wordpress.com/rest/v1.2/sites/%s/posts/new/" % WP_SITE
+# Endpoint para subir medios (imagen destacada) por URL:
+WP_MEDIA_API = "https://public-api.wordpress.com/rest/v1.1/sites/%s/media/new/" % WP_SITE
 USER_AGENT = "habliko-publisher/1.0"
 
 # Segundos de espera entre idiomas dentro de un mismo run, para no exceder
@@ -892,9 +894,42 @@ def prepend_image(html, img_url, alt):
 # ----------------------------------------------------------------------------
 
 
-def wp_publish(title, html, tags, category):
+def wp_upload_media(image_url, alt=""):
+    """Sube una imagen EXTERNA a la biblioteca de WordPress.com por URL
+    (parametro media_urls) y devuelve su ID, para usarla como imagen destacada
+    (featured_image). NO bloqueante: si falla, devuelve None y se publica sin
+    destacada (con la imagen en el cuerpo como respaldo)."""
+    if not image_url:
+        return None
+    fields = {"media_urls": image_url}
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        req = urllib.request.Request(
+            WP_MEDIA_API, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print("   AVISO: fallo subiendo la imagen destacada (%r). "
+              "Publico con la imagen en el cuerpo." % e)
+        return None
+    media = out.get("media") or []
+    if media and media[0].get("ID"):
+        print("   imagen destacada subida (media ID %s)" % media[0]["ID"])
+        return media[0]["ID"]
+    if out.get("errors"):
+        print("   AVISO: WordPress rechazo la imagen destacada: %r" % out["errors"])
+    return None
+
+
+def wp_publish(title, html, tags, category, featured_image_id=None):
     """Publica una entrada en WordPress.com via REST API v1.2.
-    tags: lista de etiquetas. category: nombre de categoria (idioma)."""
+    tags: lista de etiquetas. category: nombre de categoria (idioma).
+    featured_image_id: ID de medio para la miniatura de portada (opcional)."""
     fields = {
         "title": title,
         "content": html,
@@ -902,6 +937,8 @@ def wp_publish(title, html, tags, category):
         "tags": ",".join(tags[:4]),
         "categories": category,
     }
+    if featured_image_id:
+        fields["featured_image"] = str(featured_image_id)
     data = urllib.parse.urlencode(fields).encode("utf-8")
     headers = {
         "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
@@ -934,12 +971,16 @@ def publish_one(lang, progress):
     article = groq_generate_retry(lang, topic["theme"])
     print("   titulo: %s" % article["title"])
 
-    # Imagen 1x1 (no bloqueante)
+    # Imagen 1x1: la subimos como IMAGEN DESTACADA (portada). Si la subida
+    # falla, la metemos en el cuerpo como respaldo para no quedarnos sin foto.
     body_html = article["body_html"]
+    featured_id = None
     if ADD_IMAGE:
         img_url = resolve_image_url(lang)
         if img_url:
-            body_html = prepend_image(body_html, img_url, article["title"])
+            featured_id = wp_upload_media(img_url, article["title"])
+            if not featured_id:
+                body_html = prepend_image(body_html, img_url, article["title"])
 
     # FAQ justo despues del articulo y ANTES del pie con los QR
     body_html = body_html + build_faq(lang) + build_footer(lang)
@@ -947,9 +988,9 @@ def publish_one(lang, progress):
     body_html = body_html + build_schema(
         lang, article["title"], article["meta_description"])
 
-    # Publicar
+    # Publicar (con imagen destacada si se pudo subir)
     post_url = wp_publish(
-        article["title"], body_html, article["labels"], category
+        article["title"], body_html, article["labels"], category, featured_id
     )
     print("   OK publicado: %s" % post_url)
 
