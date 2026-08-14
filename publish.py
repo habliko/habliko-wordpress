@@ -910,7 +910,18 @@ def wp_upload_media(image_url, alt=""):
     destacada (con la imagen en el cuerpo como respaldo)."""
     if not image_url:
         return None
-    fields = {"media_urls": image_url}
+    # WordPress comprueba la EXTENSION del archivo al importar por URL. Nuestra
+    # URL (…/phrase/es) no acaba en .png/.jpg, asi que WordPress la rechaza.
+    # Truco documentado: anadir "#.png" al final. El fragmento (#...) NO se
+    # envia al servidor al descargar, pero satisface la comprobacion de tipo.
+    low = image_url.lower().split("?")[0].split("#")[0]
+    if low.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+        upload_url = image_url
+    else:
+        upload_url = image_url + "#.png"
+
+    print("   subiendo imagen destacada: %s" % upload_url)
+    fields = {"media_urls": upload_url}
     data = urllib.parse.urlencode(fields).encode("utf-8")
     headers = {
         "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
@@ -922,16 +933,28 @@ def wp_upload_media(image_url, alt=""):
             WP_MEDIA_API, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=90) as resp:
             out = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")[:400]
+        except Exception:
+            pass
+        print("   AVISO: WordPress rechazo la imagen (HTTP %s). %s" % (e.code, body))
+        return None
     except Exception as e:
         print("   AVISO: fallo subiendo la imagen destacada (%r). "
               "Publico con la imagen en el cuerpo." % e)
         return None
     media = out.get("media") or []
     if media and media[0].get("ID"):
-        print("   imagen destacada subida (media ID %s)" % media[0]["ID"])
+        print("   OK imagen destacada subida (media ID %s)" % media[0]["ID"])
         return media[0]["ID"]
+    # Si no hay media, WordPress suele devolver errors[] con el motivo:
     if out.get("errors"):
-        print("   AVISO: WordPress rechazo la imagen destacada: %r" % out["errors"])
+        print("   AVISO: WordPress no importo la imagen: %r" % out["errors"])
+    else:
+        print("   AVISO: respuesta inesperada de media/new: %r"
+              % (str(out)[:300]))
     return None
 
 
