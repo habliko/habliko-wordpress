@@ -1,43 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Habliko Blogger publisher
--------------------------
-Clon del automatismo de roudeleiwen, adaptado a Habliko:
-  - 8 idiomas (es, en, fr, de, nl, it, pt, lb)
+Habliko WordPress.com publisher
+-------------------------------
+Gemelo del automatismo de Blogger, apuntando a WordPress.com como
+SEGUNDA fuente de enlaces:
+  - 8 idiomas (es, en, fr, de, nl, it, pt, lb) en UN solo sitio
   - banco de 90 temas de aprendizaje de idiomas
   - genera el articulo con Groq (openai/gpt-oss-120b)
-  - publica en Blogger via API v3 (OAuth refresh token)
+  - publica en WordPress.com via REST API v1.2 (token OAuth, sin refresh)
   - una publicacion por ejecucion, rotando idioma
+  - el idioma se usa como CATEGORIA para organizar el sitio multiidioma
   - progress.json lleva el puntero de idioma y de tema por idioma
   - CUALQUIER fallo => sys.exit(1) (GitHub Actions marca ROJO y avisa por email)
   - NO avanza el contador si algo falla (no se "salta" temas por error)
 
 Secrets necesarios (GitHub Actions -> Settings -> Secrets and variables -> Actions):
-  CEREBRAS_API_KEY  y/o  GROQ_API_KEY
-
-Autenticacion Blogger: archivo token.pickle en la raiz del repo (metodo oficial
-de Google, generado una vez en local/Colab). Ya NO se usan BLOGGER_CLIENT_ID /
-CLIENT_SECRET / REFRESH_TOKEN.
-
-Rellena BLOG_IDS con los ID reales de cada blog (Blogger -> Configuracion, o
-sacandolo de la URL de blogger.com/blog/posts/XXXXXXXXXXXX).
+  GROQ_API_KEY
+  WORDPRESS_TOKEN   (el access_token OAuth de WordPress.com)
 """
 
 import os
 import sys
 import json
 import time
-import pickle
 import datetime
 import urllib.parse
 import urllib.request
 import urllib.error
-from pathlib import Path
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-
-TOKEN_FILE = "token.pickle"
 
 # ----------------------------------------------------------------------------
 # CONFIG
@@ -46,6 +36,7 @@ TOKEN_FILE = "token.pickle"
 # ----------------------------------------------------------------------------
 # PROVEEDORES DE IA (Cerebras principal + Groq respaldo; ambos gpt-oss-120b).
 # Se prueban en orden; si uno da 429 (cupo), salta al siguiente.
+# Solo se usa un proveedor si su API key esta definida como secret.
 #   Cerebras: ~1.000.000 tokens/dia gratis | Groq: ~200.000 tokens/dia gratis
 # ----------------------------------------------------------------------------
 PROVIDERS = [
@@ -66,8 +57,11 @@ PROVIDERS = [
         "reasoning_effort": "low",
     },
 ]
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-BLOGGER_API = "https://www.googleapis.com/blogger/v3/blogs/{blog_id}/posts/"
+# Se puede usar el dominio como identificador del sitio (no hace falta el ID):
+WP_SITE = "habliko.wordpress.com"
+WP_API = "https://public-api.wordpress.com/rest/v1.2/sites/%s/posts/new/" % WP_SITE
+# Endpoint para subir medios (imagen destacada) por URL:
+WP_MEDIA_API = "https://public-api.wordpress.com/rest/v1.1/sites/%s/media/new/" % WP_SITE
 USER_AGENT = "habliko-publisher/1.0"
 
 # Segundos de espera entre idiomas dentro de un mismo run, para no exceder
@@ -102,17 +96,19 @@ HABLIKO_FACTS = (
 # --- Datos de marca para el schema Organization (entidad estable para la IA) ---
 HABLIKO_ORG_NAME = "Habliko"
 HABLIKO_LOGO_URL = "https://media.habliko.com/habliko/logos/logo.png"  # bucket habliko-media servido en media.habliko.com
-# Perfiles oficiales (sameAs): ayuda a la IA a reconocer la marca. Anade/quita
-# los que tengas. Deja solo los que existan de verdad.
 HABLIKO_SAMEAS = [
     "https://mastodon.social/@habliko",
     "https://habliko.wordpress.com",
     # "https://bsky.app/profile/habliko.bsky.social",   # cuando crees la cuenta
     # "https://www.youtube.com/@habliko",                # si lo tienes
 ]
-# Autor mostrado en el schema BlogPosting (E-E-A-T). El contenido lo genera IA;
-# usamos la marca como autor/editor, que es lo honesto y consistente.
 HABLIKO_AUTHOR = "Equipo Habliko"
+
+# WordPress.com SANEA las etiquetas <script> y deja el JSON-LD como TEXTO
+# VISIBLE en el articulo (feo). Por eso aqui el schema JSON-LD va APAGADO.
+# La FAQ VISIBLE (texto) si se publica y es la que ayuda al GEO en WordPress.
+# Ponlo en True solo si tu plan/plugin permite <script> en el contenido.
+ADD_JSONLD_SCHEMA = False
 
 # --- Imagen de cabecera (1x1 frase servida por el media worker de R2) ---
 # Poner en False para publicar sin imagen.
@@ -184,17 +180,17 @@ LANG_NAMES = {
     "lb": "Luxembourgish (Lëtzebuergesch)",
 }
 
-# BLOG_IDS de cada blog de Blogger. pt y lb quedan pendientes de crear:
-# el script los SALTA sin fallar hasta que pongas su ID real.
-BLOG_IDS = {
-    "es": "964360975499223389",
-    "en": "9082383800610858202",
-    "fr": "7154476325430769028",
-    "de": "384660374309986997",
-    "nl": "1709888985974810265",
-    "it": "8541619948136491443",
-    "pt": "5959228735063577269",
-    "lb": "8172119296712136832",
+# Como es UN solo sitio multiidioma, cada post se etiqueta con la categoria
+# del idioma para mantenerlo organizado.
+LANG_CATEGORY = {
+    "es": "Español",
+    "en": "English",
+    "fr": "Français",
+    "de": "Deutsch",
+    "nl": "Nederlands",
+    "it": "Italiano",
+    "pt": "Português",
+    "lb": "Lëtzebuergesch",
 }
 
 PROGRESS_FILE = "progress.json"
@@ -418,6 +414,8 @@ def _provider_request(provider, system, user):
 
 
 def _multi_generate(system, user):
+    """Devuelve el texto (JSON) generado por el primer proveedor que responda.
+    Si uno da 429, prueba el siguiente. Usa solo proveedores con API key."""
     active = [p for p in PROVIDERS if os.environ.get(p["key_env"])]
     if not active:
         raise RuntimeError("Ningun proveedor tiene API key (CEREBRAS/GROQ)")
@@ -575,6 +573,9 @@ def _qr_block(img_url, label, caption_alt):
 # 5 preguntas reales por idioma. La respuesta da la solucion directa y, cuando
 # procede, empuja a la web (respuesta completa), al email o a WhatsApp.
 # Ademas se inyecta schema.org FAQPage (JSON-LD) para que Google la lea.
+# NOTA WordPress.com: puede sanear/eliminar etiquetas <script>. El bloque FAQ
+# VISIBLE (texto) es lo que de verdad ayuda aqui; el JSON-LD se incluye por si
+# tu plan lo respeta, pero no dependas de el en WordPress.com.
 # ----------------------------------------------------------------------------
 
 FAQ_TITLE = {
@@ -588,7 +589,6 @@ FAQ_TITLE = {
     "lb": "Dacks gestallte Froen",
 }
 
-# Cada idioma: lista de (pregunta, respuesta_html). {url} = habliko.com
 FAQ_ITEMS = {
     "es": [
         ("¿Qué es Habliko?",
@@ -736,7 +736,6 @@ FAQ_ITEMS = {
     ],
 }
 
-# Linea de contacto bajo la FAQ (email siempre; WhatsApp solo si hay numero).
 FAQ_CONTACT = {
     "es": ("¿No encuentras tu respuesta? Visita habliko.com, "
            "escríbenos a {email}{wa} y te ayudamos."),
@@ -756,7 +755,6 @@ FAQ_CONTACT = {
            "schreift eis op {email}{wa} a mir hëllefen Iech."),
 }
 
-# Texto del enlace de WhatsApp por idioma (solo si HABLIKO_WHATSAPP tiene numero)
 FAQ_WA_LABEL = {
     "es": "por WhatsApp", "en": "on WhatsApp", "fr": "sur WhatsApp",
     "de": "per WhatsApp", "nl": "via WhatsApp", "it": "su WhatsApp",
@@ -770,10 +768,9 @@ def _faq_contact_line(lang):
     wa = ""
     if HABLIKO_WHATSAPP.strip():
         label = FAQ_WA_LABEL.get(lang, FAQ_WA_LABEL["en"])
-        wa = ' o <a href="https://wa.me/%s">%s</a>' % (
-            HABLIKO_WHATSAPP.strip(), label) if lang == "es" else \
-             ' / <a href="https://wa.me/%s">%s</a>' % (
-            HABLIKO_WHATSAPP.strip(), label)
+        sep = " o " if lang == "es" else " / "
+        wa = '%s<a href="https://wa.me/%s">%s</a>' % (
+            sep, HABLIKO_WHATSAPP.strip(), label)
     tpl = FAQ_CONTACT.get(lang, FAQ_CONTACT["en"])
     return tpl.format(url=HABLIKO_URL, email=email_link, wa=wa)
 
@@ -798,7 +795,6 @@ def build_faq(lang):
             '<p style="margin:0;">%s</p>'
             '</div>' % (_html_escape(q), a_html)
         )
-        # Para el schema: texto plano (sin etiquetas HTML de los enlaces)
         a_plain = a_html.replace('<a href="%s">' % HABLIKO_URL, "") \
                         .replace("</a>", "")
         schema_items.append({
@@ -807,33 +803,31 @@ def build_faq(lang):
             "acceptedAnswer": {"@type": "Answer", "text": a_plain},
         })
 
-    # Linea de contacto (email + WhatsApp pendiente)
     parts.append(
         '<p style="margin:0.4em 0 0 0;font-size:0.95em;color:#555;">%s</p>'
         % _faq_contact_line(lang)
     )
     parts.append("</section>")
 
-    # Schema JSON-LD (Google lo lee aunque no se vea)
-    schema = {
-        "@context": "https://schema.org",
-        "@type": "FAQPage",
-        "mainEntity": schema_items,
-    }
-    parts.append(
-        '<script type="application/ld+json">%s</script>'
-        % json.dumps(schema, ensure_ascii=False)
-    )
+    if ADD_JSONLD_SCHEMA:
+        schema = {
+            "@context": "https://schema.org",
+            "@type": "FAQPage",
+            "mainEntity": schema_items,
+        }
+        parts.append(
+            '<script type="application/ld+json">%s</script>'
+            % json.dumps(schema, ensure_ascii=False)
+        )
     return "".join(parts)
 
 
 def build_schema(lang, title, meta_description):
     """Schema.org JSON-LD: BlogPosting + Organization (grafo).
-    Ayuda a la IA a reconocer el articulo (autor/fecha) y la marca Habliko
-    como entidad estable. Se inyecta como <script> en el cuerpo del post."""
+    NOTA: WordPress.com puede eliminar <script>; ademas Jetpack ya genera
+    schema de articulo. Se incluye por consistencia con Blogger."""
     now_iso = datetime.datetime.now(datetime.timezone.utc).replace(
         microsecond=0).isoformat()
-
     org = {
         "@type": "Organization",
         "@id": HABLIKO_URL + "/#organization",
@@ -845,7 +839,6 @@ def build_schema(lang, title, meta_description):
     }
     if HABLIKO_SAMEAS:
         org["sameAs"] = HABLIKO_SAMEAS
-
     blogposting = {
         "@type": "BlogPosting",
         "headline": title,
@@ -858,7 +851,6 @@ def build_schema(lang, title, meta_description):
         "publisher": {"@id": HABLIKO_URL + "/#organization"},
         "mainEntityOfPage": {"@type": "WebPage", "@id": HABLIKO_URL},
     }
-
     graph = {"@context": "https://schema.org", "@graph": [blogposting, org]}
     return ('<script type="application/ld+json">%s</script>'
             % json.dumps(graph, ensure_ascii=False))
@@ -907,37 +899,65 @@ def prepend_image(html, img_url, alt):
 
 
 # ----------------------------------------------------------------------------
-# BLOGGER
+# WORDPRESS.COM
 # ----------------------------------------------------------------------------
 
 
-def get_service():
-    """Carga token.pickle y devuelve el servicio de Blogger (metodo oficial,
-    igual que Roude Leiwen). Refresca el token si esta caducado."""
-    creds = None
-    if Path(TOKEN_FILE).exists():
-        with open(TOKEN_FILE, "rb") as f:
-            creds = pickle.load(f)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(TOKEN_FILE, "wb") as f:
-            pickle.dump(creds, f)
-    if not creds or not creds.valid:
-        raise Exception("token.pickle invalido o ausente")
-    return build("blogger", "v3", credentials=creds)
+def wp_upload_media(image_url, alt=""):
+    """Sube una imagen EXTERNA a la biblioteca de WordPress.com por URL
+    (parametro media_urls) y devuelve su ID, para usarla como imagen destacada
+    (featured_image). NO bloqueante: si falla, devuelve None y se publica sin
+    destacada (con la imagen en el cuerpo como respaldo)."""
+    if not image_url:
+        return None
+    fields = {"media_urls": image_url}
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        req = urllib.request.Request(
+            WP_MEDIA_API, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print("   AVISO: fallo subiendo la imagen destacada (%r). "
+              "Publico con la imagen en el cuerpo." % e)
+        return None
+    media = out.get("media") or []
+    if media and media[0].get("ID"):
+        print("   imagen destacada subida (media ID %s)" % media[0]["ID"])
+        return media[0]["ID"]
+    if out.get("errors"):
+        print("   AVISO: WordPress rechazo la imagen destacada: %r" % out["errors"])
+    return None
 
 
-def blogger_publish(service, blog_id, title, html, labels, meta):
-    body = {
-        "kind": "blogger#post",
+def wp_publish(title, html, tags, category, featured_image_id=None):
+    """Publica una entrada en WordPress.com via REST API v1.2.
+    tags: lista de etiquetas. category: nombre de categoria (idioma).
+    featured_image_id: ID de medio para la miniatura de portada (opcional)."""
+    fields = {
         "title": title,
         "content": html,
-        "labels": labels[:4],
+        "status": "publish",
+        "tags": ",".join(tags[:4]),
+        "categories": category,
     }
-    result = service.posts().insert(
-        blogId=blog_id, body=body, isDraft=False
-    ).execute()
-    return result.get("url", "(sin url)")
+    if featured_image_id:
+        fields["featured_image"] = str(featured_image_id)
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + os.environ["WORDPRESS_TOKEN"],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    req = urllib.request.Request(WP_API, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        out = json.loads(resp.read().decode("utf-8"))
+    return out.get("URL") or out.get("short_URL") or "(sin url)"
 
 
 # ----------------------------------------------------------------------------
@@ -945,50 +965,54 @@ def blogger_publish(service, blog_id, title, html, labels, meta):
 # ----------------------------------------------------------------------------
 
 
-def publish_one(lang, service, progress):
-    """Genera y publica UN idioma en su blog. Devuelve la URL. Avanza el
-    puntero de tema de ese idioma solo si la publicacion tiene exito."""
-    blog_id = BLOG_IDS.get(lang, "")
-    if not blog_id or blog_id.startswith("PON_AQUI"):
-        raise RuntimeError("blog '%s' sin BLOG_ID configurado" % lang)
-
+def publish_one(lang, progress):
+    """Genera y publica UN idioma. Devuelve (ok, detalle). Avanza el puntero
+    de tema de ese idioma solo si la publicacion tiene exito."""
+    category = LANG_CATEGORY[lang]
     topic_idx = progress["topic_pointer"][lang] % len(TOPICS)
     topic = TOPICS[topic_idx]
 
     print("-" * 60)
-    print("Idioma %s (%s) | Blog %s | Tema #%d: %s"
-          % (lang, LANG_NAMES[lang], blog_id, topic["num"], topic["theme"]))
+    print("Idioma %s (%s) -> categoria '%s' | Tema #%d: %s"
+          % (lang, LANG_NAMES[lang], category, topic["num"], topic["theme"]))
 
+    # Generar con Groq (con reintento en 429)
     article = groq_generate_retry(lang, topic["theme"])
     print("   titulo: %s" % article["title"])
 
+    # Imagen 1x1: la subimos como IMAGEN DESTACADA (portada). Si la subida
+    # falla, la metemos en el cuerpo como respaldo para no quedarnos sin foto.
     body_html = article["body_html"]
+    featured_id = None
     if ADD_IMAGE:
         img_url = resolve_image_url(lang)
         if img_url:
-            body_html = prepend_image(body_html, img_url, article["title"])
+            featured_id = wp_upload_media(img_url, article["title"])
+            if not featured_id:
+                body_html = prepend_image(body_html, img_url, article["title"])
 
     # FAQ justo despues del articulo y ANTES del pie con los QR
     body_html = body_html + build_faq(lang) + build_footer(lang)
-    # Schema BlogPosting + Organization (invisible; lo lee la IA/Google)
-    body_html = body_html + build_schema(
-        lang, article["title"], article["meta_description"])
+    # Schema BlogPosting + Organization solo si esta permitido (WordPress.com no)
+    if ADD_JSONLD_SCHEMA:
+        body_html = body_html + build_schema(
+            lang, article["title"], article["meta_description"])
 
-    post_url = blogger_publish(
-        service, blog_id,
-        article["title"], body_html,
-        article["labels"], article["meta_description"],
+    # Publicar (con imagen destacada si se pudo subir)
+    post_url = wp_publish(
+        article["title"], body_html, article["labels"], category, featured_id
     )
     print("   OK publicado: %s" % post_url)
 
+    # Avanzar el puntero de tema de este idioma
     progress["topic_pointer"][lang] = topic_idx + 1
-    return post_url
+    return True, post_url
 
 
 def main():
     # 1) Comprobaciones de configuracion
-    if not Path(TOKEN_FILE).exists():
-        print("ERROR: falta el archivo token.pickle en el repo")
+    if not os.environ.get("WORDPRESS_TOKEN"):
+        print("ERROR: falta secret WORDPRESS_TOKEN")
         sys.exit(1)
     active = [p["name"] for p in PROVIDERS if os.environ.get(p["key_env"])]
     if not active:
@@ -999,40 +1023,39 @@ def main():
 
     progress = load_progress()
 
-    # UN idioma por ejecucion (rotacion). Con el cron cada hora, cada blog
-    # sale espaciado y no en rafaga (evita el freno antiabuso de Google).
-    lang = LANGUAGES[progress["lang_index"] % len(LANGUAGES)]
+    print("== Habliko WordPress publisher (los 8 idiomas) ==")
+    print("Sitio: %s" % WP_SITE)
 
-    print("== Habliko Blogger publisher (1 idioma por run) ==")
-    print("Idioma de este run: %s (%s)" % (lang, LANG_NAMES[lang]))
+    ok_list = []
+    fail_list = []
 
-    # Servicio de Blogger (token.pickle + libreria oficial, como Roude Leiwen)
-    print("-> Cargando token.pickle y creando servicio Blogger...")
-    try:
-        service = get_service()
-    except Exception as e:
-        print("ERROR con token.pickle: %r" % e)
-        sys.exit(1)
+    for i, lang in enumerate(LANGUAGES):
+        try:
+            publish_one(lang, progress)
+            ok_list.append(lang)
+        except urllib.error.HTTPError as e:
+            print("   ERROR HTTP %s en '%s': %s"
+                  % (e.code, lang, _read_http_error(e)))
+            fail_list.append(lang)
+        except Exception as e:
+            print("   ERROR en '%s': %r" % (lang, e))
+            fail_list.append(lang)
 
-    ok = False
-    try:
-        publish_one(lang, service, progress)
-        ok = True
-    except Exception as e:
-        print("   ERROR en '%s': %r" % (lang, e))
+        # Guardar progreso tras cada idioma (por si el run se corta)
+        save_progress(progress)
 
-    # Avanzar SIEMPRE al siguiente idioma (aunque falle, para no atascarse
-    # en uno que dé 403; el tema no se pierde, se reintenta al dar la vuelta).
-    progress["lang_index"] = (progress["lang_index"] + 1) % len(LANGUAGES)
-    save_progress(progress)
+        # Pausa entre idiomas para respetar el limite de Groq (salvo el ultimo)
+        if i < len(LANGUAGES) - 1:
+            print("   ... espero %ss (limite Groq) ..." % SLEEP_BETWEEN_LANGS)
+            time.sleep(SLEEP_BETWEEN_LANGS)
 
     print("=" * 60)
-    if ok:
-        print("Resumen: 1 OK (%s). Siguiente idioma: %s"
-              % (lang, LANGUAGES[progress["lang_index"]]))
-    else:
-        print("Resumen: 0 OK (fallo %s). Siguiente idioma: %s"
-              % (lang, LANGUAGES[progress["lang_index"]]))
+    print("Resumen: %d OK (%s) | %d fallos (%s)"
+          % (len(ok_list), ", ".join(ok_list) or "-",
+             len(fail_list), ", ".join(fail_list) or "-"))
+
+    # Si algun idioma fallo, salir con error para que GitHub avise por email
+    if fail_list:
         sys.exit(1)
 
 
