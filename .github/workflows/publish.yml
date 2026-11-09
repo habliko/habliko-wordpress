@@ -4,6 +4,7 @@ on:
   schedule:
     # Dos veces al dia (UTC), desfasado respecto a Blogger para repartir carga.
     - cron: "0 9 * * *"
+    - cron: "0 14 * * *"
     - cron: "0 19 * * *"
   workflow_dispatch: {}   # permite lanzarlo a mano desde la pestaña Actions
 
